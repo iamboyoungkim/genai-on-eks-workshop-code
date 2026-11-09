@@ -1,0 +1,69 @@
+# Neuron Monitor exporter: NeuronCore hardware metrics (utilization, memory, errors) in Prometheus format on :8000,
+# one pod per Inferentia/Trainium node. Scraped by the ADOT collector (A3) or the AMP managed scraper (A4 Ray Serve).
+#
+# Based on the AWS Neuron SDK reference DaemonSet (src/k8/k8s-neuron-monitor-daemonset.yml).
+# Deviation: tolerates every taint so it also lands on the EKS Auto Mode `neuron` NodePool.
+# NOTE: the container is privileged because it reads /dev/neuron*; node affinity keeps it on Neuron instances only.
+#
+# Usage:
+#   kubectl apply -f neuron-monitor.yaml
+#   kubectl rollout status daemonset/neuron-monitor -n kube-system --timeout=180s
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: neuron-monitor
+  namespace: kube-system
+  labels:
+    app: neuron-monitor
+spec:
+  selector:
+    matchLabels:
+      app: neuron-monitor
+  template:
+    metadata:
+      labels:
+        app: neuron-monitor
+    spec:
+      tolerations:
+        - operator: Exists
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/os
+                    operator: In
+                    values: ["linux"]
+                  - key: node.kubernetes.io/instance-type
+                    operator: In
+                    values:
+                      - inf1.xlarge
+                      - inf1.2xlarge
+                      - inf1.6xlarge
+                      - inf2.xlarge
+                      - inf2.8xlarge
+                      - inf2.24xlarge
+                      - inf2.48xlarge
+                      - trn1.2xlarge
+                      - trn1.32xlarge
+                      - trn1n.32xlarge
+      containers:
+        - name: neuron-monitor
+          image: public.ecr.aws/neuron/neuron-monitor:1.3.0
+          command: ["/opt/bin/entrypoint.sh"]
+          args: ["--port", "8000", "--neuron-monitor-config", "/opt/aws/neuron/bin/neuron-monitor.conf"]
+          ports:
+            - name: metrics
+              containerPort: 8000
+          env:
+            - name: GOMEMLIMIT
+              value: 160MiB
+          resources:
+            requests:
+              cpu: 256m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            privileged: true

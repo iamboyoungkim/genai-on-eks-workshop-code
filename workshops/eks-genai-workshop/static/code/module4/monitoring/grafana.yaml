@@ -1,0 +1,150 @@
+# In-cluster Grafana with a pre-provisioned Amazon Managed Prometheus data source (SigV4 via EKS Pod Identity).
+# Used instead of Amazon Managed Grafana because Workshop Studio accounts have no IAM Identity Center instance.
+#
+# Placeholders (substituted by the lab with sed):
+#   __AMP_ENDPOINT__  AMP workspace prometheusEndpoint (https://aps-workspaces.<region>.amazonaws.com/workspaces/ws-xxxx/)
+#   __REGION__        AWS region of the AMP workspace
+#
+# Prefer ./deploy-grafana.sh, which creates the IAM role, the Pod Identity association, the admin-password Secret and
+# then applies this file in the right order. Manual usage:
+#   kubectl create namespace grafana
+#   kubectl create secret generic grafana-admin -n grafana \
+#     --from-literal=GF_SECURITY_ADMIN_PASSWORD="$(openssl rand -base64 18 | tr -d '/+=')"
+#   sed -e "s#__AMP_ENDPOINT__#${AMP_ENDPOINT}#" -e "s#__REGION__#${AWS_REGION}#" grafana.yaml | kubectl apply -f -
+#   kubectl port-forward -n grafana svc/grafana 8081:3000
+#
+# Grafana is served under the sub-path /app/ so it works behind the Workshop Studio IDE nginx, which forwards
+# https://<ide>.cloudfront.net/app/... unchanged to localhost:8081/app/... (the IDE's /proxy/<port>/ route does not load
+# Grafana's static assets). Open:
+#   Workshop Studio IDE:   https://<ide>.cloudfront.net/app/
+#   local port-forward:    http://localhost:8081/app/
+# The Grafana HTTP API is under the same prefix: http://localhost:8081/app/api/...
+#
+# Security:
+#   - The Service is ClusterIP only. The IDE's /app route is NOT behind the IDE login, so while the port-forward runs
+#     anyone with the IDE URL reaches the Grafana login page. Stop the port-forward when you are done.
+#   - The admin password is read from the Secret `grafana-admin` (key GF_SECURITY_ADMIN_PASSWORD). There is no default:
+#     if the Secret is missing the pod stays in CreateContainerConfigError instead of starting with admin/admin.
+#   - Dashboards and the user DB live in an emptyDir and are lost when the pod is recreated.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: grafana
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: grafana
+  namespace: grafana
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-datasources
+  namespace: grafana
+data:
+  datasources.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Amazon Managed Prometheus
+        uid: amp
+        type: prometheus
+        access: proxy
+        url: __AMP_ENDPOINT__
+        isDefault: true
+        jsonData:
+          httpMethod: POST
+          sigV4Auth: true
+          sigV4AuthType: default
+          sigV4Region: __REGION__
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: grafana
+  labels:
+    app: grafana
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: grafana
+  template:
+    metadata:
+      labels:
+        app: grafana
+    spec:
+      serviceAccountName: grafana
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 472
+        fsGroup: 472
+      containers:
+        - name: grafana
+          image: grafana/grafana:11.6.16
+          ports:
+            - name: http
+              containerPort: 3000
+          env:
+            - name: GF_SECURITY_ADMIN_USER
+              value: admin
+            - name: GF_SECURITY_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: grafana-admin
+                  key: GF_SECURITY_ADMIN_PASSWORD
+            - name: GF_SERVER_ROOT_URL
+              value: "%(protocol)s://%(domain)s/app/"
+            - name: GF_SERVER_SERVE_FROM_SUB_PATH
+              value: "true"
+            - name: GF_AUTH_ANONYMOUS_ENABLED
+              value: "false"
+            - name: GF_USERS_ALLOW_SIGN_UP
+              value: "false"
+            - name: GF_AUTH_SIGV4_AUTH_ENABLED
+              value: "true"
+            - name: GF_ANALYTICS_REPORTING_ENABLED
+              value: "false"
+          readinessProbe:
+            httpGet:
+              path: /app/api/health
+              port: 3000
+            initialDelaySeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: datasources
+              mountPath: /etc/grafana/provisioning/datasources
+            - name: data
+              mountPath: /var/lib/grafana
+      volumes:
+        - name: datasources
+          configMap:
+            name: grafana-datasources
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: grafana
+spec:
+  type: ClusterIP
+  selector:
+    app: grafana
+  ports:
+    - name: http
+      port: 3000
+      targetPort: 3000

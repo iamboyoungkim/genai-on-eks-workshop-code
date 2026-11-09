@@ -1,0 +1,160 @@
+# ADOT collector: scrapes vLLM (:8000/metrics in namespace vllm) and neuron-monitor (:8000 in kube-system) pods and
+# remote-writes to Amazon Managed Prometheus, signed with SigV4.
+# AWS credentials come from EKS Pod Identity (role `adot-collector-amp` associated with SA adot/adot-collector).
+#
+# Placeholders (substituted by the lab with sed):
+#   __AMP_ENDPOINT__  AMP workspace prometheusEndpoint, WITH the trailing slash
+#                     (https://aps-workspaces.<region>.amazonaws.com/workspaces/ws-xxxx/)
+#   __REGION__        AWS region of the AMP workspace
+#
+# Usage:
+#   sed -e "s#__AMP_ENDPOINT__#${AMP_ENDPOINT}#" -e "s#__REGION__#${AWS_REGION}#" adot-collector.yaml | kubectl apply -f -
+#
+# Note: `$$` in the collector config is the collector's escape for a literal `$`, so `$${1}` reaches Prometheus as `${1}`.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: adot
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: adot-collector
+  namespace: adot
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: adot-collector
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "nodes", "namespaces"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: adot-collector
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: adot-collector
+subjects:
+  - kind: ServiceAccount
+    name: adot-collector
+    namespace: adot
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: adot-collector-config
+  namespace: adot
+data:
+  config.yaml: |
+    extensions:
+      sigv4auth:
+        region: __REGION__
+        service: aps
+    receivers:
+      prometheus:
+        config:
+          global:
+            scrape_interval: 15s
+          scrape_configs:
+            - job_name: vllm
+              metrics_path: /metrics
+              kubernetes_sd_configs:
+                - role: pod
+                  namespaces:
+                    names: [vllm]
+              relabel_configs:
+                # vLLM pods do not always declare a containerPort, so scrape the fixed port 8000
+                - source_labels: [__meta_kubernetes_pod_phase]
+                  regex: Running
+                  action: keep
+                - source_labels: [__meta_kubernetes_pod_ip]
+                  target_label: __address__
+                  replacement: $${1}:8000
+                - source_labels: [__meta_kubernetes_namespace]
+                  target_label: namespace
+                - source_labels: [__meta_kubernetes_pod_name]
+                  target_label: pod
+                - source_labels: [__meta_kubernetes_pod_label_app]
+                  target_label: app
+            - job_name: neuron-monitor
+              metrics_path: /
+              kubernetes_sd_configs:
+                - role: pod
+                  namespaces:
+                    names: [kube-system]
+              relabel_configs:
+                - source_labels: [__meta_kubernetes_pod_label_app]
+                  regex: neuron-monitor
+                  action: keep
+                - source_labels: [__meta_kubernetes_pod_ip]
+                  target_label: __address__
+                  replacement: $${1}:8000
+                - source_labels: [__meta_kubernetes_pod_node_name]
+                  target_label: node
+                - source_labels: [__meta_kubernetes_pod_name]
+                  target_label: pod
+    processors:
+      batch:
+        timeout: 10s
+    exporters:
+      prometheusremotewrite:
+        endpoint: __AMP_ENDPOINT__api/v1/remote_write
+        auth:
+          authenticator: sigv4auth
+        resource_to_telemetry_conversion:
+          enabled: false
+    service:
+      extensions: [sigv4auth]
+      pipelines:
+        metrics:
+          receivers: [prometheus]
+          processors: [batch]
+          exporters: [prometheusremotewrite]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: adot-collector
+  namespace: adot
+  labels:
+    app: adot-collector
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: adot-collector
+  template:
+    metadata:
+      labels:
+        app: adot-collector
+    spec:
+      serviceAccountName: adot-collector
+      containers:
+        - name: adot-collector
+          image: public.ecr.aws/aws-observability/aws-otel-collector:v0.49.0
+          args: ["--config=/etc/adot/config.yaml"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10001
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/adot
+      volumes:
+        - name: config
+          configMap:
+            name: adot-collector-config
