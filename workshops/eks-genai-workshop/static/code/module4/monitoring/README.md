@@ -1,5 +1,7 @@
 # Module 4: infrastructure monitoring manifests
 
+English | [한국어](README.ko.md)
+
 Manifests used by the Track A labs **A3 "Monitoring & Scaling"** and **A4 "Ray Serve autoscaling"**.
 
 | File | What it deploys | Namespace |
@@ -96,6 +98,16 @@ curl -s "$GRAFANA/api/datasources/uid/amp/health"
 Security: the IDE `/app` route is **not** behind the IDE login, so while the port-forward runs anyone with the IDE URL
 reaches the Grafana login page. Keep the generated password, and stop the port-forward when you are done
 (`pkill -f "port-forward -n grafana"`). Do not add a LoadBalancer or Ingress for Grafana.
+
+### Data source and dashboard queries
+
+- Do not add a new data source. Use the pre-provisioned **Amazon Managed Prometheus** one (uid `amp`). The
+  `http://localhost:9090` in the Prometheus server URL field is only a placeholder.
+- One query row holds one PromQL expression. Panels with several expressions (P50/P95/P99) need one row per expression
+  (**+ Add query**). Pasting several lines into one row fails with
+  `parse error: unexpected identifier "histogram_quantile"`.
+- Aggregate buckets across pods with `sum by (le)`:
+  `histogram_quantile(0.95, sum by (le) (rate(vllm:e2e_request_latency_seconds_bucket[5m])))`
 
 ## Cleanup
 
