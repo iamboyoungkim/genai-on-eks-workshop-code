@@ -1,0 +1,9 @@
+# Local (IDE) dependencies for ingest_policies.py, the Step 7 similarity check and evaluate_rag.py.
+# pymilvus stays on 2.5.x: langchain-milvus Milvus.from_documents() uses the ORM-style Collection API, which fails with
+# "should create connection first" on pymilvus >= 2.6.
+langchain-milvus
+langchain-aws
+langchain-openai
+langchain-text-splitters
+pymilvus>=2.5,<2.6
+ragas>=0.2.14,<0.4

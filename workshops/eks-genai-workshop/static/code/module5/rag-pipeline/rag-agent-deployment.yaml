@@ -1,0 +1,105 @@
+# Loan Buddy v2 (RAG) in namespace `workshop`, next to the module3 MCP servers.
+# Applied by deploy-rag-agent.sh, which first creates:
+#   - ServiceAccount loan-buddy-v2 + EKS Pod Identity association (S3 image bucket + Bedrock Titan embeddings)
+#   - Secret loan-buddy-v2-env (LiteLLM key, Langfuse keys, S3 bucket, region), copied from the module3 agent
+#   - ConfigMap loan-buddy-v2-code (credit-underwriting-agent-v2.py)
+#
+# The container reuses the v1 image and installs the two extra packages at start, so the pod needs outbound access
+# to PyPI. Startup therefore takes about 1 to 2 minutes; the startupProbe allows up to 5.
+# The Service is ClusterIP only; reach it with `kubectl port-forward service/loan-buddy-agent-v2 8081:8080 -n workshop`.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: loan-buddy-v2
+  namespace: workshop
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loan-buddy-agent-v2
+  namespace: workshop
+  labels:
+    app: loan-buddy-agent-v2
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: loan-buddy-agent-v2
+  template:
+    metadata:
+      labels:
+        app: loan-buddy-agent-v2
+    spec:
+      serviceAccountName: loan-buddy-v2
+      containers:
+        - name: loan-buddy-agent-v2
+          image: public.ecr.aws/agentic-ai-platforms-on-k8s/loan-buddy-example:1.0.4
+          workingDir: /app
+          command: ["/bin/sh", "-c"]
+          args:
+            - >-
+              pip install --no-cache-dir --quiet --disable-pip-version-check
+              "langchain-aws" "pymilvus>=2.5,<2.7"
+              && exec python /code/credit-underwriting-agent-v2.py
+          env:
+            - name: PYTHONPATH
+              value: /app
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: LANGFUSE_URL
+              value: "http://langfuse-web.langfuse.svc.cluster.local:3000"
+            - name: GATEWAY_URL
+              value: "http://litellm.litellm.svc.cluster.local:4000"
+            - name: MILVUS_URI
+              value: "http://milvus.milvus.svc.cluster.local:19530"
+            - name: MCP_ADDRESS_VALIDATOR
+              value: "http://mcp-address-validator:8000"
+            - name: MCP_EMPLOYMENT_VALIDATOR
+              value: "http://mcp-employment-validator:8000"
+            - name: MCP_IMAGE_PROCESSOR
+              value: "http://mcp-image-processor:8000"
+          envFrom:
+            - secretRef:
+                name: loan-buddy-v2-env
+          ports:
+            - name: http
+              containerPort: 8080
+          startupProbe:
+            httpGet:
+              path: /api/health
+              port: 8080
+            periodSeconds: 10
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 8080
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 250m
+              memory: 1Gi
+            limits:
+              memory: 2Gi
+          volumeMounts:
+            - name: code
+              mountPath: /code
+              readOnly: true
+      volumes:
+        - name: code
+          configMap:
+            name: loan-buddy-v2-code
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: loan-buddy-agent-v2
+  namespace: workshop
+spec:
+  type: ClusterIP
+  selector:
+    app: loan-buddy-agent-v2
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
